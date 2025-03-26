@@ -8,7 +8,7 @@ import io
 load_dotenv()
 
 # Set up OpenAI API key
-client = OpenAI(api_key="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")
+client = OpenAI(api_key="")
 
 app = Flask(__name__)
 
