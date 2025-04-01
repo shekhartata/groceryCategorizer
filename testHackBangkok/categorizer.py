@@ -1,21 +1,99 @@
 from openai import OpenAI
 import os
 from dotenv import load_dotenv
-from flask import Flask, request, render_template, send_file
+from flask import Flask, request, render_template, send_file, jsonify
 import io
+from sentence_transformers import SentenceTransformer
+from pymongo import MongoClient
+import numpy as np
+from datetime import datetime
+import threading
+from queue import Queue
 
 # Load environment variables
 load_dotenv()
 
 # Set up OpenAI API key
-client = OpenAI(api_key="")
+client = OpenAI(
+api_kay=<>
+)
+
+# Initialize sentence transformer model
+model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# MongoDB connection
+mongo_client = MongoClient(
+    "mongodb+srv://user-test-sync:shekhartesting@cluster0.eyv8o.mongodb.net/?retryWrites=true&w=majority"
+)
+db = mongo_client.testing
+products_collection = db.documents
+
+# Create vector index if it doesn't exist
+try:
+    products_collection.create_index([
+        ("embedding", "vectorSearch")
+    ], {
+        "name": "vector_index",
+        "numDimensions": 384,  # Dimension for all-MiniLM-L6-v2 model
+        "similarity": "cosine"
+    })
+except Exception as e:
+    print(f"Index creation error (might already exist): {str(e)}")
+
+# Create a queue for async processing
+processing_queue = Queue()
+
+def async_mongodb_processor():
+    while True:
+        try:
+            # Get data from queue
+            data = processing_queue.get()
+            if data is None:  # Poison pill to stop the thread
+                break
+                
+            result, products = data
+            
+            # Process categories and prepare documents for batch insert
+            documents = []
+            current_category = None
+            for line in result.split('\n'):
+                if line.startswith('**'):  # Category line
+                    current_category = line.strip('*').strip()
+                elif line.strip() and current_category:
+                    product_name = line.strip()
+                    # Create embedding for the product
+                    embedding = create_embedding(product_name)
+                    # Prepare document for batch insert
+                    documents.append({
+                        'product_name': product_name,
+                        'category': current_category,
+                        'embedding': embedding,
+                        'created_at': datetime.utcnow()
+                    })
+            
+            # Batch insert all documents at once
+            if documents:
+                products_collection.insert_many(documents)
+                print(f"Successfully inserted {len(documents)} documents")
+            
+            processing_queue.task_done()
+        except Exception as e:
+            print(f"Error in async processing: {str(e)}")
+            processing_queue.task_done()
+
+# Start the async processor thread
+processor_thread = threading.Thread(target=async_mongodb_processor, daemon=True)
+processor_thread.start()
 
 app = Flask(__name__)
+
+def create_embedding(text):
+    return model.encode(text).tolist()
 
 def categorize_products(products):
     prompt = """
     You are an expert in product categorization. Categorize each product below into an appropriate category.
-    Output format: "Categoy (in bold) followed by a colon, then a list of products in that category, one product per line. Sorted in alphabetical order"
+    Output format: "Categoy (in bold) followed by a colon, then a list of products in that category, one product per line. Sorted in alphabetical order. Also dont add any other text to the output"
 
     Products:
     """
@@ -38,6 +116,82 @@ def categorize_products(products):
     )
 
     return response.choices[0].message.content.strip()
+
+@app.route('/search', methods=['POST'])
+def search_products():
+    query = request.json.get('query')
+    if not query:
+        return jsonify({'error': 'No query provided'}), 400
+    
+    # Create embedding for the search query
+    query_embedding = create_embedding(query)
+    
+    # Perform vector search in MongoDB
+    results = products_collection.aggregate([
+        {
+            "$vectorSearch": {
+                "queryVector": query_embedding,
+                "path": "embedding",
+                "numCandidates": 100,
+                "limit": 5,
+                "index": "vector_index_test"
+            }
+        },
+        {
+            "$project": {
+                "_id": {"$toString": "$_id"},
+                "product_name": 1,
+                "category": 1,
+                "score": {"$meta": "vectorSearchScore"}
+            }
+        }
+    ])
+    
+    # Format results for OpenAI context
+    context = "Based on the following similar products found:\n\n"
+    for result in results:
+        context += f"- {result['product_name']} (Category: {result['category']}, Similarity: {(result['score'] * 100):.2f}%)\n"
+    
+    # Create OpenAI prompt
+    prompt = f"""
+    Query: {query}
+    
+    {context}
+    
+    Please provide a yes or no response about the query, considering the similar products found above. 
+    Include relevant information about other products belonging to same category. Avoid mentioning similarity score.
+    Also keep the response user-friendly and relevant. If context is empty, please answer - "No items in inventory".
+    """
+    
+    # Get response from OpenAI
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a product expert who provides detailed information about products and their relationships. Do not provide answers from internet. Just provide the answer based on the products and their relationships."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            max_tokens=500,
+            temperature=0.3
+        )
+        
+        ai_response = response.choices[0].message.content.strip()
+        
+        return jsonify({
+            'vector_results': list(results),
+            'ai_response': ai_response
+        })
+    except Exception as e:
+        return jsonify({
+            'error': f'Error getting AI response: {str(e)}',
+            'vector_results': list(results)
+        }), 500
 
 @app.route('/', methods=['GET', 'POST'])
 def upload_file():
@@ -70,12 +224,21 @@ def upload_file():
                 output.write(result)
                 output.seek(0)
                 
-                return send_file(
-                    io.BytesIO(output.getvalue().encode('utf-8')),
+                # Store the file content for later use
+                file_content = output.getvalue()
+                
+                # Send the file first
+                response = send_file(
+                    io.BytesIO(file_content.encode('utf-8')),
                     mimetype='text/plain',
                     as_attachment=True,
                     download_name='output.txt'
                 )
+                
+                # Queue the MongoDB processing for async execution
+                processing_queue.put((result, products))
+                
+                return response
             except Exception as e:
                 return f'Error processing file: {str(e)}'
         else:
@@ -104,14 +267,14 @@ def upload_file():
                 color: #333;
                 text-align: center;
             }
-            .upload-form {
+            .upload-form, .search-form {
                 text-align: center;
                 margin-top: 20px;
             }
             .file-input {
                 margin: 20px 0;
             }
-            .submit-btn {
+            .submit-btn, .search-btn {
                 background-color: #4CAF50;
                 color: white;
                 padding: 10px 20px;
@@ -120,7 +283,7 @@ def upload_file():
                 cursor: pointer;
                 font-size: 16px;
             }
-            .submit-btn:hover {
+            .submit-btn:hover, .search-btn:hover {
                 background-color: #45a049;
             }
             .submit-btn:disabled {
@@ -163,6 +326,43 @@ def upload_file():
                 color: #4CAF50;
                 font-size: 14px;
             }
+            .search-results {
+                margin-top: 20px;
+                text-align: left;
+            }
+            .search-input {
+                padding: 8px;
+                width: 300px;
+                margin-right: 10px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+            }
+            .result-item {
+                padding: 10px;
+                border-bottom: 1px solid #eee;
+            }
+            .result-item:last-child {
+                border-bottom: none;
+            }
+            .score {
+                color: #666;
+                font-size: 12px;
+            }
+            .ai-response {
+                margin-bottom: 20px;
+                padding: 15px;
+                background-color: #f8f9fa;
+                border-radius: 4px;
+                border-left: 4px solid #4CAF50;
+            }
+            .ai-response h3 {
+                margin-top: 0;
+                color: #4CAF50;
+            }
+            .vector-results h3 {
+                color: #333;
+                margin-bottom: 10px;
+            }
         </style>
     </head>
     <body>
@@ -182,6 +382,11 @@ def upload_file():
                 <div class="success-message" id="successMessage">
                     File processed successfully! You can upload another file.
                 </div>
+            </div>
+            <div class="search-form">
+                <input type="text" class="search-input" id="searchInput" placeholder="Search for products...">
+                <button class="search-btn" id="searchBtn">Search</button>
+                <div class="search-results" id="searchResults"></div>
             </div>
             <div class="instructions">
                 <h3>File Format Instructions:</h3>
@@ -239,6 +444,51 @@ def upload_file():
                         loading.style.display = 'none';
                         alert('Error processing file. Please try again.');
                     }
+                }
+            });
+
+            document.getElementById('searchBtn').addEventListener('click', async function() {
+                const searchInput = document.getElementById('searchInput');
+                const searchResults = document.getElementById('searchResults');
+                const query = searchInput.value.trim();
+
+                if (!query) {
+                    alert('Please enter a search query');
+                    return;
+                }
+
+                try {
+                    const response = await fetch('/search', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ query: query })
+                    });
+
+                    if (response.ok) {
+                        const data = await response.json();
+                        searchResults.innerHTML = `
+                            <div class="ai-response">
+                                <h3>AI Analysis:</h3>
+                                <p>${data.ai_response}</p>
+                            </div>
+                            <div class="vector-results">
+                                ${data.vector_results.map(result => `
+                                    <div class="result-item">
+                                        <div>${result.product_name}</div>
+                                        <div>Category: ${result.category}</div>
+                                        <div class="score">Similarity Score: ${(result.score * 100).toFixed(2)}%</div>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        `;
+                    } else {
+                        throw new Error('Search failed');
+                    }
+                } catch (error) {
+                    console.error('Error:', error);
+                    searchResults.innerHTML = '<div class="result-item">Error performing search. Please try again.</div>';
                 }
             });
         </script>
