@@ -15,7 +15,7 @@ load_dotenv()
 
 # Set up OpenAI API key
 client = OpenAI(
-api_kay=<>
+api_key=<>
 )
 
 # Initialize sentence transformer model
